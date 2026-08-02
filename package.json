@@ -1,0 +1,23 @@
+{
+  "name": "@okship/run-action",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OKShip GitHub Action — trigger evidence-generation runs from CI.",
+  "author": "okship-dev",
+  "license": "MIT",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "ncc build src/index.ts -o dist --minify",
+    "typecheck": "tsc --noEmit",
+    "format": "prettier --write src/"
+  },
+  "dependencies": {
+    "@actions/core": "^1.11.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@vercel/ncc": "^0.38.3",
+    "prettier": "^3.4.0",
+    "typescript": "^5.7.0"
+  }
+}

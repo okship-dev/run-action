@@ -1,0 +1,37 @@
+name: 'OKShip Run'
+description: 'Trigger an OKShip evidence-generation run from CI. Optionally wait for the run to complete and surface the verdict.'
+author: 'okship-dev'
+
+branding:
+  icon: 'check-circle'
+  color: 'green'
+
+inputs:
+  api_key:
+    description: 'OKShip API key. Generate one in your OKShip dashboard and store in repo secrets (e.g. secrets.OKSHIP_API_KEY).'
+    required: true
+  app_id:
+    description: 'OKShip app UUID to run scenarios against.'
+    required: true
+  scenarios:
+    description: 'Optional comma-separated scenario UUIDs. Defaults to all scenarios on the app.'
+    required: false
+  wait_for_completion:
+    description: 'If true (default), poll until the run reaches a terminal state and emit verdict. If false, return immediately after the run is enqueued. Long-running scenarios may hit the 30-minute polling timeout — the action will exit successfully with run_id and run_url set but verdict empty in that case.'
+    required: false
+    default: 'true'
+  okship_api_base:
+    description: 'OKShip API base URL. Required for v0.1.0. Example: https://your-okship-host.example.com (replace with your OKShip deployment URL).'
+    required: true
+
+outputs:
+  run_id:
+    description: 'The OKShip run UUID. Always set after a successful trigger.'
+  run_url:
+    description: 'Direct link to the run in the OKShip dashboard. Always set after a successful trigger.'
+  verdict:
+    description: 'Run outcome: pass | fail | ambiguous. Only set when wait_for_completion=true AND the run reached a terminal state with overall_result computed.'
+
+runs:
+  using: 'node24'
+  main: 'dist/index.js'

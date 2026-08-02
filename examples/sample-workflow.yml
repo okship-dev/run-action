@@ -1,0 +1,40 @@
+# Example workflow for okship-dev/run-action
+#
+# This workflow triggers an OKShip evidence-generation run on every push to
+# main, waits for completion, and gates the build on the verdict.
+#
+# Setup:
+#   1. Generate an OKShip API key in your dashboard (Settings → API Keys).
+#   2. Add it as a repository secret named OKSHIP_API_KEY.
+#   3. Replace <your-app-uuid> with your OKShip app's UUID.
+#   4. Replace https://your-okship-host.example.com with your OKShip deployment URL.
+
+name: OKShip CI run
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  okship:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger OKShip evidence-generation run
+        id: okship_run
+        uses: okship-dev/run-action@v0.1.0
+        with:
+          api_key: ${{ secrets.OKSHIP_API_KEY }}
+          app_id: <your-app-uuid>
+          okship_api_base: https://your-okship-host.example.com
+
+      - name: Fail the build if scenarios failed
+        if: steps.okship_run.outputs.verdict == 'fail'
+        run: |
+          echo "OKShip run failed. Review at ${{ steps.okship_run.outputs.run_url }}"
+          exit 1
+
+      - name: Surface ambiguous verdict for manual review
+        if: steps.okship_run.outputs.verdict == 'ambiguous'
+        run: |
+          echo "OKShip verdict is ambiguous — manual review recommended."
+          echo "Run dashboard: ${{ steps.okship_run.outputs.run_url }}"
