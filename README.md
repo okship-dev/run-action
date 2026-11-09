@@ -29,7 +29,7 @@ The action posts to OKShip's `/api/runs` endpoint with the supplied app and (opt
 
 | Name | Required | Default | Description |
 |---|---|---|---|
-| `api_key` | yes | — | OKShip API key. Generate one in your OKShip dashboard under Settings → API keys and store it in repo secrets. |
+| `api_key` | yes | — | OKShip API key. An organisation owner generates one in the OKShip dashboard under Settings → API keys. Store it in repo secrets. |
 | `app_id` | yes | — | OKShip app UUID to run scenarios against. |
 | `scenarios` | no | (all) | Comma-separated scenario UUIDs. Defaults to all scenarios on the app. |
 | `wait_for_completion` | no | `true` | If `true`, poll until the run terminates and emit `verdict`. If `false`, return immediately after the run is enqueued. |
@@ -47,8 +47,10 @@ What each verdict means:
 
 - `pass`: every scenario's goal was reached.
 - `fail`: no scenario's goal was reached.
-- `mixed`: the scenarios got different verdicts, for example some reached their goal and some didn't.
+- `mixed`: the scenarios got different verdicts. That includes some goals passing while others are "not sure" (`ambiguous`), with none failing.
 - `ambiguous`: OKShip couldn't tell whether the goals were reached. Review the run.
+
+No verdict at all is also possible: the run failed, the run was cancelled, OKShip is withholding the verdict, or polling timed out. The gating example below stops the build in all of those cases too.
 
 ## Behavior
 
@@ -58,7 +60,8 @@ What each verdict means:
 - **Busy retry:** If OKShip answers `503 admission_busy` (it is starting another run for your organisation and created nothing), the action waits for the `Retry-After` time (at most 60s) and tries again, up to 3 times, within the 30-minute budget. Each retry is logged. No other trigger failure is retried, so a retry can never create a second run.
 - **Poll failures:** Transient errors (5xx, network, timeout) retry with backoff. A 404 during polling fails the workflow step with "run not found."
 - **Enqueue warning:** If OKShip returns `warning: run_created_but_enqueue_failed`, the action sets `run_id`/`run_url` and surfaces a warning without polling. Check the dashboard for the pending run.
-- **Finished without a verdict:** The action stops polling, leaves `verdict` unset and surfaces a warning that names the reason: the run failed, the run was cancelled, or the run finished and OKShip is holding its verdict for review.
+- **Finished without a verdict:** The action stops polling, leaves `verdict` unset and surfaces a warning that names the reason: the run failed, the run was cancelled, or OKShip is withholding the run's verdict (open the run to see why).
+- **Your API key stays out of the log:** The action registers the key as a secret as soon as it reads it, and removes it from every message it writes.
 - **Unrecognised verdict:** If OKShip returns a verdict this version of the action doesn't know, the step fails and asks you to update the action.
 
 ## Common errors
@@ -67,9 +70,9 @@ These are the errors `POST /api/runs` can return to this action. The error code 
 
 | Error code | HTTP status | Cause | Fix |
 |---|---|---|---|
-| `invalid_api_key` | 401 | The API key is malformed, revoked, or doesn't match an active key. | Create a new key under Settings → API keys and update the repo secret. |
-| `api_key_creator_not_member` | 403 | The person who created the API key is no longer a member of the organisation. | Have a current member create a new key and update the repo secret. |
-| `insufficient_role` | 403 | The person who created the API key doesn't have a role that can start runs. The key acts with its creator's role, and starting a run needs `editor` or above. | Raise that member's role, or have an editor or owner create the key. |
+| `invalid_api_key` | 401 | The API key is malformed, revoked, or doesn't match an active key. | Have an organisation owner create a new key under Settings → API keys, then update the repo secret. |
+| `api_key_creator_not_member` | 403 | The person who created the API key is no longer a member of the organisation. | Have a current organisation owner create a new key, then update the repo secret. |
+| `insufficient_role` | 403 | The person who created the API key no longer has a role that can start runs. The key acts with its creator's current role, and starting a run needs `editor` or above. | Give that member back a role of `editor` or above, or have a current organisation owner create a new key. Only owners can create API keys. |
 | `invalid_app_id` | 400 | `app_id` isn't a well-formed UUID. | Copy the app's UUID from your OKShip dashboard. |
 | `invalid_scenario_ids` | 400 | One of the `scenarios` values isn't a well-formed UUID. One bad ID refuses the whole request. | Check the `scenarios` input. |
 | `app_not_found` | 404 | `app_id` doesn't exist or doesn't belong to your organisation. | Verify the UUID via your OKShip dashboard. |
@@ -87,20 +90,22 @@ These are the errors `POST /api/runs` can return to this action. The error code 
 
 ## Gating workflows on the verdict
 
+One gate step stops the build on any verdict other than `pass`, including no verdict. It needs `wait_for_completion: true` (the default): without waiting there is never a verdict, so the gate always stops the build.
+
 ```yaml
 - uses: okship-dev/run-action@v0.1.0
   id: okship_run
   with:
     api_key: ${{ secrets.OKSHIP_API_KEY }}
     app_id: <your-app-uuid>
+    wait_for_completion: true
 
-- name: Fail the build if any goal didn't work
-  if: steps.okship_run.outputs.verdict == 'fail' || steps.okship_run.outputs.verdict == 'mixed'
-  run: exit 1
-
-- name: Flag a not-sure verdict for review
-  if: steps.okship_run.outputs.verdict == 'ambiguous'
-  run: echo "Review needed at ${{ steps.okship_run.outputs.run_url }}"
+- name: Stop the build unless every goal passed
+  if: steps.okship_run.outputs.verdict != 'pass'
+  run: |
+    echo "OKShip verdict: ${{ steps.okship_run.outputs.verdict || 'no verdict' }}"
+    echo "Review the run: ${{ steps.okship_run.outputs.run_url }}"
+    exit 1
 ```
 
 ## Versioning

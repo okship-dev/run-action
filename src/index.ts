@@ -7,6 +7,8 @@ const INITIAL_POLL_MS = 10 * 1000;            // first sleep before poll 1
 const MAX_POLL_MS = 60 * 1000;                // backoff cap
 const TRIGGER_TIMEOUT_MS = 30 * 1000;         // POST /api/runs timeout
 const POLL_TIMEOUT_MS = 15 * 1000;            // GET /status timeout
+// Every sleep and every request timeout is clamped to what is left of
+// OVERALL_TIMEOUT_MS, and the deadline is rechecked before every request.
 
 // ── Admission-busy retry (POST /api/runs answering 503 admission_busy) ──
 // OKShip answers 503 { error: "admission_busy" } with Retry-After when another
@@ -50,6 +52,37 @@ interface StatusResponse {
   // verdict OKShip is withholding (held or quarantined).
   overall_result?: string | null;
 }
+
+// ── Secret redaction ──────────────────────────────────────────
+// The API key is registered with core.setSecret as soon as it is read, so the
+// runner masks it in the job log. That is not enough on its own: a key with an
+// internal newline is masked line by line at best, and an error thrown while
+// building the request (fetch's header validation) quotes the raw value. So
+// every message this action logs passes through redact() as well.
+const secrets: string[] = [];
+
+function addSecret(value: string): void {
+  if (!value) return;
+  core.setSecret(value);
+  const forms = new Set<string>([value, JSON.stringify(value).slice(1, -1)]);
+  for (const line of value.split(/\r?\n/)) {
+    if (line.trim().length >= 4) forms.add(line);
+  }
+  // Longest first, so a whole key is replaced before any of its lines.
+  secrets.push(...[...forms].sort((a, b) => b.length - a.length));
+}
+
+function redact(message: string): string {
+  let out = message;
+  for (const s of secrets) out = out.split(s).join("***");
+  return out;
+}
+
+const log = {
+  info: (message: string) => core.info(redact(message)),
+  warning: (message: string) => core.warning(redact(message)),
+  fail: (message: string) => core.setFailed(redact(message)),
+};
 
 // ── HTTP error ────────────────────────────────────────────────
 class HttpError extends Error {
@@ -170,6 +203,13 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+class BudgetExhausted extends Error {
+  constructor() {
+    super("The 30-minute budget ran out before OKShip accepted the run.");
+    this.name = "BudgetExhausted";
+  }
+}
+
 // POST /api/runs, retried ONLY on 503 admission_busy (see the constants above).
 async function triggerRun(
   url: string,
@@ -178,13 +218,20 @@ async function triggerRun(
   deadline: number,
 ): Promise<TriggerResponse> {
   for (let attempt = 0; ; attempt++) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new BudgetExhausted();
     try {
-      return await postJson<TriggerResponse>(url, body, headers, TRIGGER_TIMEOUT_MS);
+      return await postJson<TriggerResponse>(
+        url,
+        body,
+        headers,
+        Math.min(TRIGGER_TIMEOUT_MS, remaining),
+      );
     } catch (err) {
       if (!isAdmissionBusy(err) || attempt >= ADMISSION_BUSY_MAX_RETRIES) throw err;
       const waitMs = retryAfterMs(err.retryAfter);
       if (Date.now() + waitMs >= deadline) throw err;
-      core.info(
+      log.info(
         `OKShip is busy starting another run for this organisation (503 admission_busy). ` +
           `Retry ${attempt + 1} of ${ADMISSION_BUSY_MAX_RETRIES} in ${Math.ceil(waitMs / 1000)}s.`,
       );
@@ -199,6 +246,7 @@ async function run(): Promise<void> {
   const deadline = startedAt + OVERALL_TIMEOUT_MS;
 
   const apiKey = core.getInput("api_key", { required: true });
+  addSecret(apiKey);
   const appId = core.getInput("app_id", { required: true });
   const scenariosRaw = core.getInput("scenarios");
   const waitForCompletion = core.getInput("wait_for_completion") !== "false";
@@ -225,38 +273,43 @@ async function run(): Promise<void> {
   core.setOutput("run_url", runUrl);
 
   if (trigger.warning === "run_created_but_enqueue_failed") {
-    core.warning(
+    log.warning(
       `Run ${trigger.run_id} was created but the worker queue rejected it. The run exists in 'pending' state — check the OKShip dashboard.`,
     );
     return;
   }
 
   if (!waitForCompletion) {
-    core.info(
+    log.info(
       `Run ${trigger.run_id} enqueued. Skipping poll (wait_for_completion=false).`,
     );
     return;
   }
 
-  core.info(`Run ${trigger.run_id} enqueued. Polling for completion...`);
+  log.info(`Run ${trigger.run_id} enqueued. Polling for completion...`);
   let nextDelayMs = INITIAL_POLL_MS;
 
-  while (Date.now() < deadline) {
-    await sleep(nextDelayMs);
+  for (;;) {
+    let remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await sleep(Math.min(nextDelayMs, remaining));
+
+    remaining = deadline - Date.now();
+    if (remaining <= 0) break;
 
     let status: StatusResponse;
     try {
       status = await getJson<StatusResponse>(
         `${apiBase}/api/runs/${trigger.run_id}/status`,
         { "User-Agent": USER_AGENT },
-        POLL_TIMEOUT_MS,
+        Math.min(POLL_TIMEOUT_MS, remaining),
       );
     } catch (err) {
       if (err instanceof HttpError && err.status === 404) {
-        core.setFailed(`Run ${trigger.run_id} not found during poll.`);
+        log.fail(`Run ${trigger.run_id} not found during poll.`);
         return;
       }
-      core.info(
+      log.info(
         `Poll attempt failed (${err instanceof Error ? err.message : String(err)}); retrying.`,
       );
       nextDelayMs = Math.min(nextDelayMs * 2, MAX_POLL_MS);
@@ -268,13 +321,13 @@ async function run(): Promise<void> {
       return;
     }
 
-    core.info(
+    log.info(
       `Run ${trigger.run_id} status: ${status.status}. Continuing poll.`,
     );
     nextDelayMs = Math.min(nextDelayMs * 2, MAX_POLL_MS);
   }
 
-  core.warning(
+  log.warning(
     `Polling timeout reached after 30 minutes. Run ${trigger.run_id} is still in flight. ` +
       `Check the OKShip dashboard at ${runUrl} for completion.`,
   );
@@ -282,54 +335,49 @@ async function run(): Promise<void> {
 
 // A finished run (status complete, failed or cancelled). OKShip's status route
 // returns overall_result for every finished run EXCEPT one whose verdict it is
-// withholding (a held or quarantined run): that run still reports its real
-// status and complete: true, with overall_result left out. A run only reaches
-// status 'complete' with a verdict computed, so 'complete' with none means the
-// verdict is being withheld, not that it was never produced.
+// withholding: that run still reports its real status and complete: true, with
+// overall_result left out. Held and quarantined runs look identical here, so
+// the message names neither. A run only reaches status 'complete' with a verdict
+// computed, so 'complete' with none means the verdict is being withheld.
 function reportFinished(runId: string, runUrl: string, status: StatusResponse): void {
   const result = status.overall_result;
 
   if (result != null) {
     if (!isVerdict(result)) {
-      core.setFailed(
+      log.fail(
         `Run ${runId} finished with verdict '${result}', which this version of the action does not recognise. ` +
           `Update okship-dev/run-action. Run: ${runUrl}`,
       );
       return;
     }
     core.setOutput("verdict", result);
-    core.info(`Run ${runId} complete. Verdict: ${result}.`);
+    log.info(`Run ${runId} complete. Verdict: ${result}.`);
     return;
   }
 
   switch (status.status) {
     case "complete":
-      core.warning(
-        `Run ${runId} finished, but OKShip is holding its verdict for review, so no verdict is set. ` +
-          `Open the run for its current state: ${runUrl}`,
+      log.warning(
+        `OKShip is withholding this run's verdict, so no verdict is set. Open the run to see why: ${runUrl}`,
       );
       return;
     case "failed":
-      core.warning(
+      log.warning(
         `Run ${runId} failed before OKShip returned a verdict, so no verdict is set. Open the run: ${runUrl}`,
       );
       return;
     case "cancelled":
-      core.warning(
+      log.warning(
         `Run ${runId} was cancelled before OKShip returned a verdict, so no verdict is set. Open the run: ${runUrl}`,
       );
       return;
     default:
-      core.warning(
+      log.warning(
         `Run ${runId} finished with status '${status.status}' and no verdict. Open the run: ${runUrl}`,
       );
   }
 }
 
 run().catch((err) => {
-  if (err instanceof Error) {
-    core.setFailed(err.message);
-  } else {
-    core.setFailed(String(err));
-  }
+  log.fail(err instanceof Error ? err.message : String(err));
 });

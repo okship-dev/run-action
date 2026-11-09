@@ -8,7 +8,8 @@
 #     GitHub Actions integration (both under Settings in the OKShip dashboard).
 #
 # Setup:
-#   1. Generate an OKShip API key in your dashboard (Settings → API keys).
+#   1. Have an organisation owner generate an OKShip API key in the dashboard
+#      (Settings → API keys).
 #   2. Add it as a repository secret named OKSHIP_API_KEY.
 #   3. Replace <your-app-uuid> with your OKShip app's UUID.
 #
@@ -30,15 +31,14 @@ jobs:
         with:
           api_key: ${{ secrets.OKSHIP_API_KEY }}
           app_id: <your-app-uuid>
+          # The gate below needs a verdict, so keep waiting for completion.
+          wait_for_completion: true
 
-      - name: Fail the build if any goal didn't work
-        if: steps.okship_run.outputs.verdict == 'fail' || steps.okship_run.outputs.verdict == 'mixed'
+      # Stops the build on any verdict other than pass, and on no verdict at
+      # all (run failed, cancelled, verdict withheld, or polling timed out).
+      - name: Stop the build unless every goal passed
+        if: steps.okship_run.outputs.verdict != 'pass'
         run: |
-          echo "OKShip verdict: ${{ steps.okship_run.outputs.verdict }}. Review at ${{ steps.okship_run.outputs.run_url }}"
+          echo "OKShip verdict: ${{ steps.okship_run.outputs.verdict || 'no verdict' }}"
+          echo "Review the run: ${{ steps.okship_run.outputs.run_url }}"
           exit 1
-
-      - name: Surface a not-sure verdict for review
-        if: steps.okship_run.outputs.verdict == 'ambiguous'
-        run: |
-          echo "OKShip couldn't tell whether every goal was reached. Review needed."
-          echo "Run dashboard: ${{ steps.okship_run.outputs.run_url }}"
