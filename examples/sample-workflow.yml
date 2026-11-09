@@ -3,11 +3,16 @@
 # This workflow triggers an OKShip evidence-generation run on every push to
 # main, waits for completion, and gates the build on the verdict.
 #
+# Requirements:
+#   - Your OKShip organisation has its own Anthropic key saved and a connected
+#     GitHub Actions integration (both under Settings in the OKShip dashboard).
+#
 # Setup:
-#   1. Generate an OKShip API key in your dashboard (Settings → API Keys).
+#   1. Generate an OKShip API key in your dashboard (Settings → API keys).
 #   2. Add it as a repository secret named OKSHIP_API_KEY.
 #   3. Replace <your-app-uuid> with your OKShip app's UUID.
-#   4. Replace https://your-okship-host.example.com with your OKShip deployment URL.
+#
+# Pinning: @v0.1.0 pins a tag. A full commit SHA is the strictest pin.
 
 name: OKShip CI run
 
@@ -25,16 +30,15 @@ jobs:
         with:
           api_key: ${{ secrets.OKSHIP_API_KEY }}
           app_id: <your-app-uuid>
-          okship_api_base: https://your-okship-host.example.com
 
-      - name: Fail the build if scenarios failed
-        if: steps.okship_run.outputs.verdict == 'fail'
+      - name: Fail the build if any goal didn't work
+        if: steps.okship_run.outputs.verdict == 'fail' || steps.okship_run.outputs.verdict == 'mixed'
         run: |
-          echo "OKShip run failed. Review at ${{ steps.okship_run.outputs.run_url }}"
+          echo "OKShip verdict: ${{ steps.okship_run.outputs.verdict }}. Review at ${{ steps.okship_run.outputs.run_url }}"
           exit 1
 
-      - name: Surface ambiguous verdict for manual review
+      - name: Surface a not-sure verdict for review
         if: steps.okship_run.outputs.verdict == 'ambiguous'
         run: |
-          echo "OKShip verdict is ambiguous — manual review recommended."
+          echo "OKShip couldn't tell whether every goal was reached. Review needed."
           echo "Run dashboard: ${{ steps.okship_run.outputs.run_url }}"

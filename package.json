@@ -9,6 +9,7 @@
   "scripts": {
     "build": "ncc build src/index.ts -o dist --minify",
     "typecheck": "tsc --noEmit",
+    "test": "node --test \"test/*.test.mjs\"",
     "format": "prettier --write src/"
   },
   "dependencies": {

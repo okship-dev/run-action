@@ -21,8 +21,9 @@ inputs:
     required: false
     default: 'true'
   okship_api_base:
-    description: 'OKShip API base URL. Required for v0.1.0. Example: https://your-okship-host.example.com (replace with your OKShip deployment URL).'
-    required: true
+    description: 'OKShip API base URL. Defaults to https://okship.dev. Set it only to point the action at a different OKShip deployment.'
+    required: false
+    default: 'https://okship.dev'
 
 outputs:
   run_id:
@@ -30,7 +31,7 @@ outputs:
   run_url:
     description: 'Direct link to the run in the OKShip dashboard. Always set after a successful trigger.'
   verdict:
-    description: 'Run outcome: pass | fail | ambiguous. Only set when wait_for_completion=true AND the run reached a terminal state with overall_result computed.'
+    description: 'Run outcome: pass | fail | mixed | ambiguous. Only set when wait_for_completion=true AND the run reached a terminal state with overall_result computed.'
 
 runs:
   using: 'node24'
