@@ -65,7 +65,8 @@ function addSecret(value: string): void {
   if (!value) return;
   core.setSecret(value);
   const forms = new Set<string>([value, JSON.stringify(value).slice(1, -1)]);
-  for (const line of value.split(/\r?\n/)) {
+  // Split on any run of CR and/or LF: a lone CR separates pieces too.
+  for (const line of value.split(/[\r\n]+/)) {
     if (line.trim().length >= 4) forms.add(line);
   }
   // Longest first, so a whole key is replaced before any of its lines.

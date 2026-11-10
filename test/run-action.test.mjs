@@ -47,7 +47,12 @@ async function mockOkship(script) {
       if (req.method === "POST" && req.url === "/api/runs") {
         r = script.post[Math.min(posts++, script.post.length - 1)];
       } else if (req.method === "GET" && req.url === `/api/runs/${RUN_ID}/status`) {
-        r = script.poll[Math.min(polls++, script.poll.length - 1)];
+        // A function poll is called with the action's own elapsed time, from
+        // the x-fake-elapsed header test/fast-clock.cjs adds.
+        r =
+          typeof script.poll === "function"
+            ? script.poll(Number(req.headers["x-fake-elapsed"]))
+            : script.poll[Math.min(polls++, script.poll.length - 1)];
       } else {
         r = { status: 404, body: { error: "not_found" } };
       }
@@ -55,14 +60,25 @@ async function mockOkship(script) {
         req.socket.destroy();
         return;
       }
-      res.writeHead(r.status, { "content-type": "application/json", ...(r.headers ?? {}) });
-      res.end(JSON.stringify(r.body));
+      const answer = () => {
+        if (res.destroyed) return;
+        res.writeHead(r.status, { "content-type": "application/json", ...(r.headers ?? {}) });
+        res.end(JSON.stringify(r.body));
+      };
+      // delayMs is REAL milliseconds.
+      if (r.delayMs) setTimeout(answer, r.delayMs);
+      else answer();
     });
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
   const posted = () => requests.filter((q) => q.method === "POST");
-  return { base, requests, posted, close: () => new Promise((resolve) => server.close(resolve)) };
+  const close = () =>
+    new Promise((resolve) => {
+      server.closeAllConnections();
+      server.close(resolve);
+    });
+  return { base, requests, posted, close };
 }
 
 function runAction({ base, apiKey = API_KEY, extraEnv = {}, nodeArgs = [] }) {
@@ -321,12 +337,12 @@ describe("okship run-action", { concurrency: true }, () => {
       assert.equal(r.code, 0, r.stdout);
       assert.match(r.stdout, /::warning::Polling timeout reached after 30 minutes/);
       const lines = fs.readFileSync(record, "utf8").trim().split("\n");
-      const gets = lines.filter((l) => l.includes(" GET "));
+      const gets = lines.filter((l) => / GET http/.test(l));
       assert.ok(gets.length > 5, `only ${gets.length} polls recorded`);
-      const last = Math.max(...lines.map((l) => Number(l.split(" ")[0])));
-      // 30 min = 1,800,000 ms. The 2 s allowance covers the gap between this
-      // preload's start and the action reading its own start time. The old loop
-      // issued a request at about 30m10s.
+      const starts = lines.filter((l) => / (GET|POST) http/.test(l));
+      const last = Math.max(...starts.map((l) => Number(l.split(" ")[0])));
+      // 30 min = 1,800,000 ms, on the action's virtual clock. The old loop
+      // started a request after the deadline.
       assert.ok(last <= 1_802_000, `a request started at ${last} ms on the action's clock`);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
@@ -351,4 +367,103 @@ describe("okship run-action", { concurrency: true }, () => {
       }
     });
   }
+
+  // Each piece of the key, ON ITS OWN, is fed through the action's real logging
+  // path: the scripted server answers the first poll with a 500 whose error is
+  // piece 1 (logged by info, "Poll attempt failed (...)"), then finishes the run
+  // with verdict = piece 2 (logged by setFailed, "unrecognised verdict").
+  for (const [label, key, pieces] of [
+    ["LF", "ok_live_abc_first_line\ndef_second_line_secret", ["ok_live_abc_first_line", "def_second_line_secret"]],
+    ["lone CR", "ok_live_header\rbreaker_secret_value", ["ok_live_header", "breaker_secret_value"]],
+  ]) {
+    check(`${label}-separated pieces of the key, logged on their own, are redacted`, async () => {
+      const script = [
+        { status: 202, body: accepted },
+        { status: 500, body: { error: pieces[0] } },
+        { status: 200, body: { id: RUN_ID, status: "complete", complete: true, overall_result: pieces[1] } },
+      ];
+      const r = await runAction({
+        base: "http://127.0.0.1:9",
+        apiKey: key,
+        nodeArgs: ["--require", path.join(here, "fetch-script.cjs")],
+        extraEnv: { FETCH_SCRIPT: JSON.stringify(script) },
+      });
+      assert.equal(r.code, 1, r.stdout);
+      // Non-vacuous: both messages were logged, with the piece replaced.
+      assert.match(r.stdout, /Poll attempt failed \(GET .* returned 500: \*\*\*\); retrying\./);
+      assert.match(r.stdout, /::error::Run .* finished with verdict '\*\*\*'/);
+      for (const p of pieces) {
+        const visible = r.stdoutOnly.split(/\r?\n/).filter((l) => !l.startsWith("::add-mask::")).join("\n");
+        assert.ok(!visible.includes(p) && !r.stderr.includes(p), `piece ${JSON.stringify(p)} survived`);
+      }
+      assertNoKey(r, key);
+    });
+  }
+
+  // ── The two budget clamps, each made to bind ──
+  // test/fast-clock.cjs gives the action a VIRTUAL clock (20x fast), so its
+  // timeline is exact: an answered poll costs no time, a held poll costs exactly
+  // its abort timeout, and the action sleeps 10, 20, 40, then 60 s between polls.
+  const SCALE = 20;
+  const BUDGET = 30 * 60 * 1000;
+  const ALLOW = 1000;
+  const inFlight = { status: 200, body: { id: RUN_ID, status: "pass1_running", complete: false } };
+  // Answered only after 5 s REAL, far beyond any abort timer at this scale
+  // (15 s / 20 = 750 ms), so the action's own timer always ends the request.
+  const heldPoll = { ...inFlight, delayMs: 5000 };
+  async function clockRun(poll) {
+    const ok = await mockOkship({ post: [{ status: 202, body: accepted }], poll });
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "okship-run-action-clock-"));
+    const recordPath = path.join(dir, "requests");
+    try {
+      const r = await runAction({
+        base: ok.base,
+        nodeArgs: ["--require", FAST_CLOCK],
+        extraEnv: { FETCH_RECORD_PATH: recordPath, FAST_CLOCK_SCALE: String(SCALE) },
+      });
+      const lines = fs.readFileSync(recordPath, "utf8").trim().split("\n").map((l) => {
+        const [t, ...rest] = l.split(" ");
+        return { t: Number(t), what: rest.join(" ") };
+      });
+      return { r, lines };
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      await ok.close();
+    }
+  }
+  const gets = (lines) => lines.filter((l) => l.what.startsWith("GET "));
+  const exitAt = (lines) => lines.find((l) => l.what === "EXIT").t;
+
+  check("deadline, sleep clamp: the last sleep is cut to the remaining budget, so the action finishes on time", async () => {
+    // Every poll answered at once: polls at 10, 30, 70, 130, ... 1750 s. The
+    // last sleep starts with 50 s left; unclamped, its 60 s would end at 1810 s.
+    const { r, lines } = await clockRun(() => inFlight);
+    assert.equal(r.code, 0, r.stdout);
+    assert.match(r.stdout, /::warning::Polling timeout reached after 30 minutes/);
+    const last = Math.max(...gets(lines).map((l) => l.t));
+    assert.equal(last, BUDGET - 50_000, `last poll started at ${last} ms`);
+    const exit = exitAt(lines);
+    assert.ok(exit >= BUDGET && exit <= BUDGET + ALLOW, `action finished at ${exit} ms; budget is ${BUDGET}`);
+  });
+
+  check("deadline, request clamp: a poll the server holds near the deadline is aborted at the remaining budget", async () => {
+    // Polls 2-4 are held (each costs its 15 s timeout), which moves the
+    // schedule so a poll starts 5 s before the deadline; that one is held too.
+    // Clamped, it is aborted at 1800 s; with the plain 15 s timeout, at 1810 s.
+    let i = 0;
+    const { r, lines } = await clockRun((t) => {
+      const n = i++;
+      return (n >= 1 && n <= 3) || t >= BUDGET - 20_000 ? heldPoll : inFlight;
+    });
+    assert.equal(r.code, 0, r.stdout);
+    assert.match(r.stdout, /::warning::Polling timeout reached after 30 minutes/);
+    const near = gets(lines).filter((l) => l.t >= BUDGET - 20_000);
+    assert.deepEqual(near.map((l) => l.t), [BUDGET - 5000], "expected one held poll, 5 s before the deadline");
+    const aborts = lines.filter((l) => l.what === "ERROR GET").map((l) => l.t);
+    assert.equal(aborts.length, 4, `expected 4 aborted polls, got ${aborts.length}`);
+    const lastAbort = aborts[aborts.length - 1];
+    assert.ok(lastAbort >= BUDGET && lastAbort <= BUDGET + ALLOW, `held poll aborted at ${lastAbort} ms; budget is ${BUDGET}`);
+    const exit = exitAt(lines);
+    assert.ok(exit >= BUDGET && exit <= BUDGET + ALLOW, `action finished at ${exit} ms; budget is ${BUDGET}`);
+  });
 });
