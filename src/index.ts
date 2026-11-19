@@ -2,13 +2,25 @@ import * as core from "@actions/core";
 import pkg from "../package.json";
 
 // ── Timing constants ──────────────────────────────────────────
-const OVERALL_TIMEOUT_MS = 30 * 60 * 1000;   // 30 min total budget, trigger included
+// The total budget, trigger included, is the `timeout_minutes` input:
+// default 30 (ruling 123, R123.2), accepted range 1..120. A value outside the
+// range, or not a whole number, fails the step BEFORE any run is started.
+const DEFAULT_TIMEOUT_MINUTES = 30;
+const MAX_TIMEOUT_MINUTES = 120;
 const INITIAL_POLL_MS = 10 * 1000;            // first sleep before poll 1
 const MAX_POLL_MS = 60 * 1000;                // backoff cap
 const TRIGGER_TIMEOUT_MS = 30 * 1000;         // POST /api/runs timeout
-const POLL_TIMEOUT_MS = 15 * 1000;            // GET /status timeout
-// Every sleep and every request timeout is clamped to what is left of
-// OVERALL_TIMEOUT_MS, and the deadline is rechecked before every request.
+const POLL_TIMEOUT_MS = 15 * 1000;            // one MCP get_run call's timeout
+// Every sleep and every request timeout is clamped to what is left of the
+// budget, and the deadline is rechecked before every request.
+
+// ── Reading the verdict: MCP get_run (owner ruling 130, 2026-11-19) ──
+// The poll is a stateless MCP tools/call to POST {base}/api/mcp, authenticated
+// with the SAME X-API-Key that started the run. The key therefore needs BOTH
+// scopes: `run` (POST /api/runs) and `read` (POST /api/mcp) -- R123.5. The
+// REST read API is NOT used: API_READ_ENABLED stays off in production.
+const MCP_PROTOCOL_VERSION = "2025-11-25";
+const TERMINAL_STATUSES = ["complete", "failed", "cancelled"] as const;
 
 // ── Admission-busy retry (POST /api/runs answering 503 admission_busy) ──
 // OKShip answers 503 { error: "admission_busy" } with Retry-After when another
@@ -44,13 +56,28 @@ interface TriggerResponse {
   warning?: string;
 }
 
-interface StatusResponse {
-  id: string;
-  status: string;
-  complete: boolean;
-  // Absent while the run is in flight, and absent on a finished run whose
-  // verdict OKShip is withholding (held or quarantined).
-  overall_result?: string | null;
+// OKShip's agent-read facts carry { value, provenance } (lib/agent-read/read.ts).
+interface Fact<T> {
+  value: T;
+  provenance?: string;
+}
+
+// The fields of MCP get_run's `run` this action reads (lib/mcp/schemas.ts).
+interface McpRun {
+  id: Fact<string>;
+  status: Fact<string>;
+  // ABSENT (not null) on a run whose verdict OKShip is withholding (held or
+  // quarantined); null while no verdict has been computed.
+  overall_result?: Fact<string | null>;
+  scenarios?: Array<{ result: Fact<string> }>;
+}
+
+// A refusal that is final: polling again cannot change it.
+class ReadRefused extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ReadRefused";
+  }
 }
 
 // ── Secret redaction ──────────────────────────────────────────
@@ -130,30 +157,69 @@ async function postJson<T>(
   }
 }
 
-async function getJson<T>(
-  url: string,
-  headers: Record<string, string>,
+// One MCP tools/call get_run. Returns the run, or throws:
+//   ReadRefused -- final (401/403 from the route, a tool error such as
+//                  run_not_found or insufficient_scope): the step fails now;
+//   anything else -- transient (network, 5xx, timeout): the caller retries.
+async function mcpGetRun(
+  apiBase: string,
+  runId: string,
+  apiKey: string,
+  rpcId: number,
   timeoutMs: number,
-): Promise<T> {
+): Promise<McpRun> {
+  const url = `${apiBase}/api/mcp`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(url, {
-      method: "GET",
-      headers,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream",
+        "MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
+        "X-API-Key": apiKey,
+        "User-Agent": USER_AGENT,
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: rpcId,
+        method: "tools/call",
+        params: { name: "get_run", arguments: { run_id: runId } },
+      }),
       signal: controller.signal,
     });
     const text = await res.text();
-    const parsed = text ? safeParseJson(text) : null;
+    // The route answers plain JSON or a one-event SSE stream ("data: {...}").
+    const dataLine = text.split("\n").find((l) => l.startsWith("data:"));
+    const parsed = text ? safeParseJson(dataLine ? dataLine.slice(5).trim() : text) : null;
+    if (res.status === 401 || res.status === 403 || res.status === 404) {
+      throw new ReadRefused(`OKShip could not read the run: ${describeBody(parsed)}`);
+    }
     if (!res.ok) {
       throw new HttpError(
         res.status,
         parsed,
         res.headers.get("retry-after"),
-        `GET ${url} returned ${res.status}: ${describeBody(parsed)}`,
+        `POST ${url} (get_run) returned ${res.status}: ${describeBody(parsed)}`,
       );
     }
-    return parsed as T;
+    const rpc = parsed as {
+      result?: { isError?: boolean; structuredContent?: { run?: McpRun }; content?: Array<{ text?: string }> };
+      error?: { message?: string };
+    } | null;
+    if (rpc?.error) {
+      throw new ReadRefused(`OKShip could not read the run: ${rpc.error.message ?? JSON.stringify(rpc.error)}`);
+    }
+    if (rpc?.result?.isError) {
+      const errText = rpc.result.content?.[0]?.text ?? "";
+      throw new ReadRefused(`OKShip could not read the run: ${describeBody(safeParseJson(errText))}`);
+    }
+    const run = rpc?.result?.structuredContent?.run;
+    if (!run || typeof run.status?.value !== "string") {
+      throw new Error(`POST ${url} (get_run) returned no run.`);
+    }
+    return run;
   } finally {
     clearTimeout(timer);
   }
@@ -167,10 +233,14 @@ function safeParseJson(text: string): unknown {
   }
 }
 
+// A refusal's `message` is OKShip's approved copy (for the CI gate, ADR-0046's
+// CI_GATE_COPY) and is printed VERBATIM after the error code, never reworded.
 function describeBody(body: unknown): string {
   if (body && typeof body === "object" && "error" in body) {
     const err = (body as { error: unknown }).error;
-    return typeof err === "string" ? err : JSON.stringify(body);
+    const msg = (body as { message?: unknown }).message;
+    const code = typeof err === "string" ? err : JSON.stringify(body);
+    return typeof msg === "string" && msg.length > 0 ? `${code}: ${msg}` : code;
   }
   return typeof body === "string" ? body : JSON.stringify(body ?? null);
 }
@@ -205,8 +275,8 @@ function sleep(ms: number): Promise<void> {
 }
 
 class BudgetExhausted extends Error {
-  constructor() {
-    super("The 30-minute budget ran out before OKShip accepted the run.");
+  constructor(minutes: number) {
+    super(`The ${minutes}-minute budget ran out before OKShip accepted the run.`);
     this.name = "BudgetExhausted";
   }
 }
@@ -217,10 +287,11 @@ async function triggerRun(
   body: unknown,
   headers: Record<string, string>,
   deadline: number,
+  minutes: number,
 ): Promise<TriggerResponse> {
   for (let attempt = 0; ; attempt++) {
     const remaining = deadline - Date.now();
-    if (remaining <= 0) throw new BudgetExhausted();
+    if (remaining <= 0) throw new BudgetExhausted(minutes);
     try {
       return await postJson<TriggerResponse>(
         url,
@@ -242,9 +313,16 @@ async function triggerRun(
 }
 
 // ── Main ──────────────────────────────────────────────────────
+function readTimeoutMinutes(): number | null {
+  const raw = core.getInput("timeout_minutes").trim();
+  if (raw === "") return DEFAULT_TIMEOUT_MINUTES;
+  if (!/^\d+$/.test(raw)) return null;
+  const n = Number(raw);
+  return n >= 1 && n <= MAX_TIMEOUT_MINUTES ? n : null;
+}
+
 async function run(): Promise<void> {
   const startedAt = Date.now();
-  const deadline = startedAt + OVERALL_TIMEOUT_MS;
 
   const apiKey = core.getInput("api_key", { required: true });
   addSecret(apiKey);
@@ -254,6 +332,16 @@ async function run(): Promise<void> {
   const apiBaseRaw = core.getInput("okship_api_base") || DEFAULT_API_BASE;
   const apiBase = apiBaseRaw.replace(/\/+$/, "");
 
+  // Validated BEFORE the POST, so a bad value never starts a billable run.
+  const minutes = readTimeoutMinutes();
+  if (minutes === null) {
+    log.fail(
+      `timeout_minutes must be a whole number from 1 to ${MAX_TIMEOUT_MINUTES}. No run was started.`,
+    );
+    return;
+  }
+  const deadline = startedAt + minutes * 60 * 1000;
+
   const triggerBody: Record<string, unknown> = { app_id: appId };
   if (scenariosRaw) {
     triggerBody.scenario_ids = scenariosRaw
@@ -262,13 +350,18 @@ async function run(): Promise<void> {
       .filter(Boolean);
   }
 
+  // Any refusal (non-2xx) fails the step, as `curl --fail` does; the server's
+  // message is quoted verbatim (describeBody).
   const trigger = await triggerRun(
     `${apiBase}/api/runs`,
     triggerBody,
     { "X-API-Key": apiKey, "User-Agent": USER_AGENT },
     deadline,
+    minutes,
   );
 
+  // MCP has no proof-link read (generate_proof_link is not served), so the
+  // link printed is the run's dashboard page.
   const runUrl = `${apiBase}/dashboard/runs/${trigger.run_id}`;
   core.setOutput("run_id", trigger.run_id);
   core.setOutput("run_url", runUrl);
@@ -287,8 +380,9 @@ async function run(): Promise<void> {
     return;
   }
 
-  log.info(`Run ${trigger.run_id} enqueued. Polling for completion...`);
+  log.info(`Run ${trigger.run_id} enqueued. Waiting up to ${minutes} minutes for the verdict...`);
   let nextDelayMs = INITIAL_POLL_MS;
+  let rpcId = 0;
 
   for (;;) {
     let remaining = deadline - Date.now();
@@ -298,16 +392,18 @@ async function run(): Promise<void> {
     remaining = deadline - Date.now();
     if (remaining <= 0) break;
 
-    let status: StatusResponse;
+    let runRead: McpRun;
     try {
-      status = await getJson<StatusResponse>(
-        `${apiBase}/api/runs/${trigger.run_id}/status`,
-        { "User-Agent": USER_AGENT },
+      runRead = await mcpGetRun(
+        apiBase,
+        trigger.run_id,
+        apiKey,
+        ++rpcId,
         Math.min(POLL_TIMEOUT_MS, remaining),
       );
     } catch (err) {
-      if (err instanceof HttpError && err.status === 404) {
-        log.fail(`Run ${trigger.run_id} not found during poll.`);
+      if (err instanceof ReadRefused) {
+        log.fail(`${err.message} Run: ${runUrl}`);
         return;
       }
       log.info(
@@ -317,31 +413,32 @@ async function run(): Promise<void> {
       continue;
     }
 
-    if (status.complete) {
-      reportFinished(trigger.run_id, runUrl, status);
+    if ((TERMINAL_STATUSES as readonly string[]).includes(runRead.status.value)) {
+      reportFinished(trigger.run_id, runUrl, runRead);
       return;
     }
 
     log.info(
-      `Run ${trigger.run_id} status: ${status.status}. Continuing poll.`,
+      `Run ${trigger.run_id} status: ${runRead.status.value}. Continuing poll.`,
     );
     nextDelayMs = Math.min(nextDelayMs * 2, MAX_POLL_MS);
   }
 
-  log.warning(
-    `Polling timeout reached after 30 minutes. Run ${trigger.run_id} is still in flight. ` +
-      `Check the OKShip dashboard at ${runUrl} for completion.`,
-  );
+  log.fail(`No answer from OKShip within ${minutes} minutes. The run keeps going: ${runUrl}`);
 }
 
-// A finished run (status complete, failed or cancelled). OKShip's status route
-// returns overall_result for every finished run EXCEPT one whose verdict it is
-// withholding: that run still reports its real status and complete: true, with
-// overall_result left out. Held and quarantined runs look identical here, so
-// the message names neither. A run only reaches status 'complete' with a verdict
-// computed, so 'complete' with none means the verdict is being withheld.
-function reportFinished(runId: string, runUrl: string, status: StatusResponse): void {
-  const result = status.overall_result;
+function countResults(run: McpRun, result: string): number {
+  return (run.scenarios ?? []).filter((s) => s.result?.value === result).length;
+}
+
+// A finished run (status complete, failed or cancelled). ONLY `pass` passes the
+// job. `fail`, `ambiguous` ("not sure") and `mixed` fail it: by v0.1.0's rule
+// (README, Verdicts) a mixed run's scenarios disagree, so it always holds at
+// least one fail or not-sure. No verdict -- withheld, failed, cancelled -- fails
+// it too: the job cannot claim a pass it was not shown.
+function reportFinished(runId: string, runUrl: string, run: McpRun): void {
+  const withheld = !("overall_result" in run);
+  const result = run.overall_result?.value ?? null;
 
   if (result != null) {
     if (!isVerdict(result)) {
@@ -352,31 +449,30 @@ function reportFinished(runId: string, runUrl: string, status: StatusResponse): 
       return;
     }
     core.setOutput("verdict", result);
-    log.info(`Run ${runId} complete. Verdict: ${result}.`);
-    return;
+    const failed = countResults(run, "fail");
+    const notSure = countResults(run, "ambiguous");
+    switch (result) {
+      case "pass":
+        log.info(`All scenarios passed. Run: ${runUrl}`);
+        return;
+      case "fail":
+      case "ambiguous":
+      case "mixed": {
+        const parts: string[] = [];
+        if (failed > 0) parts.push(`${failed} scenario(s) failed.`);
+        if (notSure > 0) parts.push(`${notSure} scenario(s) came back not sure.`);
+        if (parts.length === 0) parts.push(`Verdict: ${result}.`);
+        log.fail(`${parts.join(" ")} Run: ${runUrl}`);
+        return;
+      }
+    }
   }
 
-  switch (status.status) {
-    case "complete":
-      log.warning(
-        `OKShip is withholding this run's verdict, so no verdict is set. Open the run to see why: ${runUrl}`,
-      );
-      return;
-    case "failed":
-      log.warning(
-        `Run ${runId} failed before OKShip returned a verdict, so no verdict is set. Open the run: ${runUrl}`,
-      );
-      return;
-    case "cancelled":
-      log.warning(
-        `Run ${runId} was cancelled before OKShip returned a verdict, so no verdict is set. Open the run: ${runUrl}`,
-      );
-      return;
-    default:
-      log.warning(
-        `Run ${runId} finished with status '${status.status}' and no verdict. Open the run: ${runUrl}`,
-      );
+  if (withheld && run.status.value === "complete") {
+    log.fail(`This run's results are on hold. See the dashboard: ${runUrl}`);
+    return;
   }
+  log.fail(`OKShip couldn't finish this run (${run.status.value}). Run: ${runUrl}`);
 }
 
 run().catch((err) => {

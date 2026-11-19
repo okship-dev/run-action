@@ -23,16 +23,17 @@ jobs:
 
 ## What it does
 
-The action posts to OKShip's `/api/runs` endpoint with the supplied app and (optional) scenarios, then polls `/api/runs/<id>/status` until the run reaches a terminal state (`complete`, `failed`, or `cancelled`). The verdict (`pass | fail | mixed | ambiguous`) is emitted as a workflow output for downstream steps.
+The action posts to OKShip's `/api/runs` endpoint with the supplied app and (optional) scenarios, then reads the run through OKShip MCP (`get_run` on `/api/mcp`, with the same API key) until it reaches a terminal state (`complete`, `failed`, or `cancelled`). The verdict (`pass | fail | mixed | ambiguous`) is emitted as a workflow output, and **the step fails unless the verdict is `pass`**.
 
 ## Inputs
 
 | Name | Required | Default | Description |
 |---|---|---|---|
-| `api_key` | yes | — | OKShip API key. An organisation owner generates one in the OKShip dashboard under Settings → API keys. Store it in repo secrets. |
+| `api_key` | yes | — | OKShip API key. An organisation owner generates one in the OKShip dashboard under Settings → API keys. Store it in repo secrets. It needs the **Start runs** scope, and the **Read** scope too when `wait_for_completion` is `true`. |
 | `app_id` | yes | — | OKShip app UUID to run scenarios against. |
 | `scenarios` | no | (all) | Comma-separated scenario UUIDs. Defaults to all scenarios on the app. |
-| `wait_for_completion` | no | `true` | If `true`, poll until the run terminates and emit `verdict`. If `false`, return immediately after the run is enqueued. |
+| `wait_for_completion` | no | `true` | If `true`, wait until the run finishes, emit `verdict`, and fail the step unless it is `pass`. If `false`, return immediately after the run is enqueued. |
+| `timeout_minutes` | no | `30` | How long to wait for the verdict, in whole minutes, from 1 to 120. Any other value fails the step before a run is started. |
 | `okship_api_base` | no | `https://okship.dev` | OKShip API base URL. Set it only to point the action at a different OKShip deployment. |
 
 ## Outputs
@@ -50,17 +51,17 @@ What each verdict means:
 - `mixed`: the scenarios got different verdicts. That includes some goals passing while others are "not sure" (`ambiguous`), with none failing.
 - `ambiguous`: OKShip couldn't tell whether the goals were reached. Review the run.
 
-No verdict at all is also possible: the run failed, the run was cancelled, OKShip is withholding the verdict, or polling timed out. The gating example below stops the build in all of those cases too.
+No verdict at all is also possible: the run failed, the run was cancelled, OKShip is withholding the verdict, or polling timed out. The step fails in every one of those cases, and for `fail`, `mixed` and `ambiguous`. Only `pass` passes it.
 
 ## Behavior
 
-- **Polling cadence:** 10s initial delay, exponential backoff up to 60s cap, 30-minute overall timeout.
-- **Polling timeout:** If the run hasn't reached a terminal state within 30 minutes, the action exits successfully with `run_id` and `run_url` set and surfaces a warning. `verdict` is not set in this case. Long-running scenarios are a valid outcome — check the dashboard link.
-- **Trigger failures:** Non-2xx response from `POST /api/runs` fails the workflow step. The one exception is `503 admission_busy`, below.
+- **Polling cadence:** 10s initial delay, exponential backoff up to 60s cap, `timeout_minutes` overall budget (default 30).
+- **Polling timeout:** If the run hasn't reached a terminal state within the budget, the step fails with `run_id` and `run_url` set. `verdict` is not set. The run keeps going; check the dashboard link.
+- **Trigger failures:** Non-2xx response from `POST /api/runs` fails the workflow step, and the log quotes OKShip's refusal message word for word. The one exception is `503 admission_busy`, below.
 - **Busy retry:** If OKShip answers `503 admission_busy` (it is starting another run for your organisation and created nothing), the action waits for the `Retry-After` time (at most 60s) and tries again, up to 3 times, within the 30-minute budget. Each retry is logged. No other trigger failure is retried, so a retry can never create a second run.
-- **Poll failures:** Transient errors (5xx, network, timeout) retry with backoff. A 404 during polling fails the workflow step with "run not found."
+- **Poll failures:** Transient errors (5xx, network, timeout) retry with backoff. A refused read (401 or 403 from `/api/mcp`, for example `insufficient_scope` on a key without the Read scope, or a `run_not_found` tool error) fails the step at once.
 - **Enqueue warning:** If OKShip returns `warning: run_created_but_enqueue_failed`, the action sets `run_id`/`run_url` and surfaces a warning without polling. Check the dashboard for the pending run.
-- **Finished without a verdict:** The action stops polling, leaves `verdict` unset and surfaces a warning that names the reason: the run failed, the run was cancelled, or OKShip is withholding the run's verdict (open the run to see why).
+- **Finished without a verdict:** The action stops polling, leaves `verdict` unset and fails the step, naming the reason: the run failed, the run was cancelled, or the run's results are on hold.
 - **Your API key stays out of the log:** The action registers the key as a secret as soon as it reads it, and removes it from every message it writes.
 - **Unrecognised verdict:** If OKShip returns a verdict this version of the action doesn't know, the step fails and asks you to update the action.
 
@@ -89,6 +90,8 @@ These are the errors `POST /api/runs` can return to this action. The error code 
 | `admission_busy` | 503 | OKShip is busy starting another run for your organisation. Nothing was created. | The action retries this on its own (see Behavior). If it still fails, re-run the job. |
 
 ## Gating workflows on the verdict
+
+The action's own step now fails on any verdict other than `pass`, so the gate step below is optional. It still works, and it still names the verdict in its own log line.
 
 One gate step stops the build on any verdict other than `pass`, including no verdict. It needs `wait_for_completion: true` (the default): without waiting there is never a verdict, so the gate always stops the build.
 

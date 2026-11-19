@@ -46,7 +46,7 @@ async function mockOkship(script) {
       let r;
       if (req.method === "POST" && req.url === "/api/runs") {
         r = script.post[Math.min(posts++, script.post.length - 1)];
-      } else if (req.method === "GET" && req.url === `/api/runs/${RUN_ID}/status`) {
+      } else if (req.method === "POST" && req.url === "/api/mcp") {
         // A function poll is called with the action's own elapsed time, from
         // the x-fake-elapsed header test/fast-clock.cjs adds.
         r =
@@ -62,6 +62,11 @@ async function mockOkship(script) {
       }
       const answer = () => {
         if (res.destroyed) return;
+        if (r.sse) {
+          res.writeHead(r.status, { "content-type": "text/event-stream", ...(r.headers ?? {}) });
+          res.end(`event: message\ndata: ${JSON.stringify(r.body)}\n\n`);
+          return;
+        }
         res.writeHead(r.status, { "content-type": "application/json", ...(r.headers ?? {}) });
         res.end(JSON.stringify(r.body));
       };
@@ -72,13 +77,14 @@ async function mockOkship(script) {
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
-  const posted = () => requests.filter((q) => q.method === "POST");
+  const posted = () => requests.filter((q) => q.method === "POST" && q.url === "/api/runs");
+  const polled = () => requests.filter((q) => q.url === "/api/mcp");
   const close = () =>
     new Promise((resolve) => {
       server.closeAllConnections();
       server.close(resolve);
     });
-  return { base, requests, posted, close };
+  return { base, requests, posted, polled, close };
 }
 
 function runAction({ base, apiKey = API_KEY, extraEnv = {}, nodeArgs = [] }) {
@@ -149,18 +155,37 @@ function assertNoKey(r, key = API_KEY) {
   }
 }
 
-const terminal = (overall_result) => ({
+// MCP get_run answers (lib/mcp/schemas.ts): every field is { value, provenance }.
+// `overall_result` is OMITTED (withheld) when the option is undefined.
+const fact = (value) => ({ value, provenance: "runner" });
+function mcpRun(status, overall_result, results = []) {
+  const run = { id: fact(RUN_ID), status: fact(status) };
+  if (overall_result !== undefined) {
+    run.overall_result = fact(overall_result);
+    run.scenarios = results.map((r) => ({ result: fact(r) }));
+  }
+  return { status: 200, body: { jsonrpc: "2.0", id: 1, result: { structuredContent: { run }, content: [] } } };
+}
+const toolErr = (error) => ({
   status: 200,
-  body: { id: RUN_ID, status: "complete", complete: true, overall_result },
+  body: { jsonrpc: "2.0", id: 1, result: { isError: true, content: [{ type: "text", text: JSON.stringify({ error }) }] } },
 });
+const terminal = (overall_result, results) => mcpRun("complete", overall_result, results);
+const inFlightRun = (status) => mcpRun(status, null);
 
 describe("okship run-action", { concurrency: true }, () => {
-  for (const verdict of ["pass", "fail", "mixed", "ambiguous"]) {
-    check(`verdict ${verdict} sets the verdict output`, async () => {
-      const ok = await mockOkship({ post: [{ status: 202, body: accepted }], poll: [terminal(verdict)] });
+  for (const [verdict, results, code, line] of [
+    ["pass", ["pass", "pass"], 0, /All scenarios passed\. Run: http/],
+    ["fail", ["fail", "pass"], 1, /::error::1 scenario\(s\) failed\. Run: http/],
+    ["ambiguous", ["ambiguous", "ambiguous"], 1, /::error::2 scenario\(s\) came back not sure\. Run: http/],
+    ["mixed", ["pass", "ambiguous"], 1, /::error::1 scenario\(s\) came back not sure\. Run: http/],
+  ]) {
+    check(`verdict ${verdict} sets the verdict output and exits ${code}`, async () => {
+      const ok = await mockOkship({ post: [{ status: 202, body: accepted }], poll: [terminal(verdict, results)] });
       try {
         const r = await runAction({ base: ok.base });
-        assert.equal(r.code, 0, r.stdout);
+        assert.equal(r.code, code, r.stdout);
+        assert.match(r.stdout, line);
         assert.equal(r.outputs.verdict, verdict);
         assert.equal(r.outputs.run_id, RUN_ID);
         assert.equal(r.outputs.run_url, `${ok.base}/dashboard/runs/${RUN_ID}`);
@@ -172,44 +197,43 @@ describe("okship run-action", { concurrency: true }, () => {
     });
   }
 
-  check("withheld run: polls through in-flight, stops on complete with no verdict, warns, sets no verdict", async () => {
+  check("withheld run: polls through in-flight, stops on complete with no verdict, fails, sets no verdict", async () => {
     const ok = await mockOkship({
       post: [{ status: 202, body: accepted }],
       poll: [
-        { status: 200, body: { id: RUN_ID, status: "pass2_running", complete: false } },
-        // What OKShip's status route returns for a finished, withheld run.
-        { status: 200, body: { id: RUN_ID, status: "complete", complete: true } },
+        inFlightRun("pass2_running"),
+        // What MCP get_run returns for a finished, withheld run: no overall_result KEY.
+        mcpRun("complete", undefined),
       ],
     });
     try {
       const r = await runAction({ base: ok.base });
-      assert.equal(r.code, 0, r.stdout);
+      assert.equal(r.code, 1, r.stdout);
       assert.equal(r.outputs.verdict, undefined);
-      assert.match(
-        r.stdout,
-        /::warning::OKShip is withholding this run's verdict, so no verdict is set\. Open the run to see why: http/,
-      );
-      assert.equal(ok.requests.filter((q) => q.method === "GET").length, 2);
+      assert.match(r.stdout, /::error::This run's results are on hold\. See the dashboard: http/);
+      assert.equal(ok.polled().length, 2);
       assertNoKey(r);
     } finally {
       await ok.close();
     }
   });
 
-  check("failed run with no verdict warns 'failed', sets no verdict", async () => {
+  for (const status of ["failed", "cancelled"]) {
+  check(`${status} run with no verdict fails the step, sets no verdict`, async () => {
     const ok = await mockOkship({
       post: [{ status: 202, body: accepted }],
-      poll: [{ status: 200, body: { id: RUN_ID, status: "failed", complete: true, overall_result: null } }],
+      poll: [mcpRun(status, null)],
     });
     try {
       const r = await runAction({ base: ok.base });
-      assert.equal(r.code, 0, r.stdout);
+      assert.equal(r.code, 1, r.stdout);
       assert.equal(r.outputs.verdict, undefined);
-      assert.match(r.stdout, /::warning::.*failed before OKShip returned a verdict/);
+      assert.match(r.stdout, new RegExp(`::error::OKShip couldn't finish this run \\(${status}\\)\\. Run: http`));
     } finally {
       await ok.close();
     }
   });
+  }
 
   check("503 admission_busy with Retry-After 1 is retried after ~1s, then succeeds", async () => {
     const busy = { status: 503, headers: { "retry-after": "1" }, body: { error: "admission_busy", message: "busy" } };
@@ -299,12 +323,13 @@ describe("okship run-action", { concurrency: true }, () => {
     }
   });
 
-  check("404 during poll fails the step", async () => {
-    const ok = await mockOkship({ post: [{ status: 202, body: accepted }], poll: [{ status: 404, body: { error: "not_found" } }] });
+  check("get_run tool error run_not_found fails the step at once", async () => {
+    const ok = await mockOkship({ post: [{ status: 202, body: accepted }], poll: [toolErr("run_not_found")] });
     try {
       const r = await runAction({ base: ok.base });
       assert.equal(r.code, 1, r.stdout);
-      assert.match(r.stdout, /::error::Run .* not found during poll\./);
+      assert.equal(ok.polled().length, 1);
+      assert.match(r.stdout, /::error::OKShip could not read the run: run_not_found Run: http/);
     } finally {
       await ok.close();
     }
@@ -325,19 +350,19 @@ describe("okship run-action", { concurrency: true }, () => {
     }
   });
 
-  check("deadline: no request starts after the 30-minute budget, and the step ends with the timeout warning", async () => {
+  check("timeout: no request starts after the 30-minute budget, and the step FAILS with the timeout line", async () => {
     const ok = await mockOkship({
       post: [{ status: 202, body: accepted }],
-      poll: [{ status: 200, body: { id: RUN_ID, status: "pass1_running", complete: false } }],
+      poll: [inFlightRun("pass1_running")],
     });
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "okship-run-action-clock-"));
     const record = path.join(dir, "requests");
     try {
       const r = await runAction({ base: ok.base, nodeArgs: ["--require", FAST_CLOCK], extraEnv: { FETCH_RECORD_PATH: record } });
-      assert.equal(r.code, 0, r.stdout);
-      assert.match(r.stdout, /::warning::Polling timeout reached after 30 minutes/);
+      assert.equal(r.code, 1, r.stdout);
+      assert.match(r.stdout, /::error::No answer from OKShip within 30 minutes\. The run keeps going: http/);
       const lines = fs.readFileSync(record, "utf8").trim().split("\n");
-      const gets = lines.filter((l) => / GET http/.test(l));
+      const gets = lines.filter((l) => / POST http\S*\/api\/mcp/.test(l));
       assert.ok(gets.length > 5, `only ${gets.length} polls recorded`);
       const starts = lines.filter((l) => / (GET|POST) http/.test(l));
       const last = Math.max(...starts.map((l) => Number(l.split(" ")[0])));
@@ -380,7 +405,7 @@ describe("okship run-action", { concurrency: true }, () => {
       const script = [
         { status: 202, body: accepted },
         { status: 500, body: { error: pieces[0] } },
-        { status: 200, body: { id: RUN_ID, status: "complete", complete: true, overall_result: pieces[1] } },
+        terminal(pieces[1]),
       ];
       const r = await runAction({
         base: "http://127.0.0.1:9",
@@ -390,7 +415,7 @@ describe("okship run-action", { concurrency: true }, () => {
       });
       assert.equal(r.code, 1, r.stdout);
       // Non-vacuous: both messages were logged, with the piece replaced.
-      assert.match(r.stdout, /Poll attempt failed \(GET .* returned 500: \*\*\*\); retrying\./);
+      assert.match(r.stdout, /Poll attempt failed \(POST .*\/api\/mcp \(get_run\) returned 500: \*\*\*\); retrying\./);
       assert.match(r.stdout, /::error::Run .* finished with verdict '\*\*\*'/);
       for (const p of pieces) {
         const visible = r.stdoutOnly.split(/\r?\n/).filter((l) => !l.startsWith("::add-mask::")).join("\n");
@@ -407,7 +432,7 @@ describe("okship run-action", { concurrency: true }, () => {
   const SCALE = 20;
   const BUDGET = 30 * 60 * 1000;
   const ALLOW = 1000;
-  const inFlight = { status: 200, body: { id: RUN_ID, status: "pass1_running", complete: false } };
+  const inFlight = inFlightRun("pass1_running");
   // Answered only after 5 s REAL, far beyond any abort timer at this scale
   // (15 s / 20 = 750 ms), so the action's own timer always ends the request.
   const heldPoll = { ...inFlight, delayMs: 5000 };
@@ -431,15 +456,15 @@ describe("okship run-action", { concurrency: true }, () => {
       await ok.close();
     }
   }
-  const gets = (lines) => lines.filter((l) => l.what.startsWith("GET "));
+  const gets = (lines) => lines.filter((l) => l.what.startsWith("POST ") && l.what.endsWith("/api/mcp"));
   const exitAt = (lines) => lines.find((l) => l.what === "EXIT").t;
 
   check("deadline, sleep clamp: the last sleep is cut to the remaining budget, so the action finishes on time", async () => {
     // Every poll answered at once: polls at 10, 30, 70, 130, ... 1750 s. The
     // last sleep starts with 50 s left; unclamped, its 60 s would end at 1810 s.
     const { r, lines } = await clockRun(() => inFlight);
-    assert.equal(r.code, 0, r.stdout);
-    assert.match(r.stdout, /::warning::Polling timeout reached after 30 minutes/);
+    assert.equal(r.code, 1, r.stdout);
+    assert.match(r.stdout, /::error::No answer from OKShip within 30 minutes/);
     const last = Math.max(...gets(lines).map((l) => l.t));
     assert.equal(last, BUDGET - 50_000, `last poll started at ${last} ms`);
     const exit = exitAt(lines);
@@ -455,15 +480,140 @@ describe("okship run-action", { concurrency: true }, () => {
       const n = i++;
       return (n >= 1 && n <= 3) || t >= BUDGET - 20_000 ? heldPoll : inFlight;
     });
-    assert.equal(r.code, 0, r.stdout);
-    assert.match(r.stdout, /::warning::Polling timeout reached after 30 minutes/);
+    assert.equal(r.code, 1, r.stdout);
+    assert.match(r.stdout, /::error::No answer from OKShip within 30 minutes/);
     const near = gets(lines).filter((l) => l.t >= BUDGET - 20_000);
     assert.deepEqual(near.map((l) => l.t), [BUDGET - 5000], "expected one held poll, 5 s before the deadline");
-    const aborts = lines.filter((l) => l.what === "ERROR GET").map((l) => l.t);
+    const aborts = lines.filter((l) => l.what === "ERROR POST").map((l) => l.t);
     assert.equal(aborts.length, 4, `expected 4 aborted polls, got ${aborts.length}`);
     const lastAbort = aborts[aborts.length - 1];
     assert.ok(lastAbort >= BUDGET && lastAbort <= BUDGET + ALLOW, `held poll aborted at ${lastAbort} ms; budget is ${BUDGET}`);
     const exit = exitAt(lines);
     assert.ok(exit >= BUDGET && exit <= BUDGET + ALLOW, `action finished at ${exit} ms; budget is ${BUDGET}`);
+  });
+
+  // ── M3: refusals, the read, and the timeout input ──
+  // ADR-0046's refusal text, copied from OKShip's CI_GATE_COPY
+  // (lib/runs/api-key-run-gate.ts, owner ruling 73). It must reach the log unchanged.
+  const CI_GATE_COPY = {
+    byok_required:
+      "Runs started with an API key use your own Anthropic key. Add one in Settings, under Bring your own Anthropic key (BYOK), then connect GitHub Actions.",
+    github_actions_not_connected:
+      "Runs started with an API key need GitHub Actions connected. An owner can activate it in Settings, under GitHub Actions.",
+  };
+  for (const [code, message] of Object.entries(CI_GATE_COPY)) {
+    check(`refused run (403 ${code}) fails the step and quotes ADR-0046's text verbatim`, async () => {
+      const ok = await mockOkship({ post: [{ status: 403, body: { error: code, message } }], poll: [terminal("pass")] });
+      try {
+        const r = await runAction({ base: ok.base });
+        assert.equal(r.code, 1, r.stdout);
+        assert.equal(ok.posted().length, 1);
+        assert.equal(ok.polled().length, 0);
+        const errorLine = r.stdoutOnly.split(/\r?\n/).find((l) => l.startsWith("::error::")) ?? "";
+        assert.ok(errorLine.endsWith(`returned 403: ${code}: ${message}`), errorLine);
+        assertNoKey(r);
+      } finally {
+        await ok.close();
+      }
+    });
+  }
+
+  check("a key without the Read scope: /api/mcp 403 insufficient_scope fails at once, naming it", async () => {
+    const ok = await mockOkship({
+      post: [{ status: 202, body: accepted }],
+      poll: [{ status: 403, body: { error: "insufficient_scope" } }],
+    });
+    try {
+      const r = await runAction({ base: ok.base });
+      assert.equal(r.code, 1, r.stdout);
+      assert.equal(ok.polled().length, 1);
+      assert.match(r.stdout, /::error::OKShip could not read the run: insufficient_scope Run: http/);
+      assertNoKey(r);
+    } finally {
+      await ok.close();
+    }
+  });
+
+  check("the poll is an MCP tools/call get_run with the same X-API-Key, never the REST read API", async () => {
+    const ok = await mockOkship({ post: [{ status: 202, body: accepted }], poll: [terminal("pass", ["pass"])] });
+    try {
+      const r = await runAction({ base: ok.base });
+      assert.equal(r.code, 0, r.stdout);
+      const [poll] = ok.polled();
+      assert.equal(poll.method, "POST");
+      assert.equal(poll.headers["x-api-key"], API_KEY);
+      assert.match(poll.headers.accept, /application\/json/);
+      assert.match(poll.headers.accept, /text\/event-stream/);
+      const rpc = JSON.parse(poll.body);
+      assert.equal(rpc.method, "tools/call");
+      assert.deepEqual(rpc.params, { name: "get_run", arguments: { run_id: RUN_ID } });
+      assert.equal(ok.requests.filter((q) => q.method === "GET").length, 0);
+      assert.equal(ok.requests.length, 2);
+    } finally {
+      await ok.close();
+    }
+  });
+
+  check("an SSE-framed get_run answer (data: line) is read", async () => {
+    const sse = terminal("fail", ["fail"]);
+    const ok = await mockOkship({
+      post: [{ status: 202, body: accepted }],
+      poll: [{ status: 200, sse: true, body: sse.body }],
+    });
+    try {
+      const r = await runAction({ base: ok.base });
+      assert.equal(r.code, 1, r.stdout);
+      assert.equal(r.outputs.verdict, "fail");
+      assert.match(r.stdout, /::error::1 scenario\(s\) failed\./);
+    } finally {
+      await ok.close();
+    }
+  });
+
+  for (const bad of ["0", "121", "abc", "1.5", "-5"]) {
+    check(`timeout_minutes=${JSON.stringify(bad)} fails the step before any run is started`, async () => {
+      const ok = await mockOkship({ post: [{ status: 202, body: accepted }], poll: [terminal("pass")] });
+      try {
+        const r = await runAction({ base: ok.base, extraEnv: { INPUT_TIMEOUT_MINUTES: bad } });
+        assert.equal(r.code, 1, r.stdout);
+        assert.equal(ok.requests.length, 0);
+        assert.match(r.stdout, /::error::timeout_minutes must be a whole number from 1 to 120\. No run was started\./);
+      } finally {
+        await ok.close();
+      }
+    });
+  }
+
+  check("timeout_minutes=1: the step fails at 60 s on the action's clock", async () => {
+    const ok = await mockOkship({ post: [{ status: 202, body: accepted }], poll: [inFlightRun("pass1_running")] });
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "okship-run-action-clock-"));
+    const record = path.join(dir, "requests");
+    try {
+      const r = await runAction({
+        base: ok.base,
+        nodeArgs: ["--require", FAST_CLOCK],
+        extraEnv: { FETCH_RECORD_PATH: record, INPUT_TIMEOUT_MINUTES: "1" },
+      });
+      assert.equal(r.code, 1, r.stdout);
+      assert.match(r.stdout, /::error::No answer from OKShip within 1 minutes\. The run keeps going: http/);
+      const lines = fs.readFileSync(record, "utf8").trim().split("\n");
+      const exit = Number(lines.find((l) => l.endsWith(" EXIT")).split(" ")[0]);
+      assert.ok(exit >= 60_000 && exit <= 61_000, `action finished at ${exit} ms`);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      await ok.close();
+    }
+  });
+
+  check("wait_for_completion=false: starts the run, never polls, exits 0", async () => {
+    const ok = await mockOkship({ post: [{ status: 202, body: accepted }], poll: [terminal("fail")] });
+    try {
+      const r = await runAction({ base: ok.base, extraEnv: { INPUT_WAIT_FOR_COMPLETION: "false" } });
+      assert.equal(r.code, 0, r.stdout);
+      assert.equal(ok.polled().length, 0);
+      assert.equal(r.outputs.run_id, RUN_ID);
+    } finally {
+      await ok.close();
+    }
   });
 });

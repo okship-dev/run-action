@@ -1,5 +1,5 @@
 name: 'OKShip Run'
-description: 'Trigger an OKShip evidence-generation run from CI. Optionally wait for the run to complete and surface the verdict.'
+description: 'Trigger an OKShip evidence-generation run from CI. Optionally wait for the verdict and fail the job unless every scenario passed.'
 author: 'okship-dev'
 
 branding:
@@ -8,7 +8,7 @@ branding:
 
 inputs:
   api_key:
-    description: 'OKShip API key. Generate one in your OKShip dashboard and store in repo secrets (e.g. secrets.OKSHIP_API_KEY).'
+    description: 'OKShip API key. Generate one in your OKShip dashboard and store in repo secrets (e.g. secrets.OKSHIP_API_KEY). It needs the Start runs scope, and also the Read scope when wait_for_completion is true (the verdict is read through OKShip MCP).'
     required: true
   app_id:
     description: 'OKShip app UUID to run scenarios against.'
@@ -17,9 +17,13 @@ inputs:
     description: 'Optional comma-separated scenario UUIDs. Defaults to all scenarios on the app.'
     required: false
   wait_for_completion:
-    description: 'If true (default), poll until the run reaches a terminal state and emit verdict. If false, return immediately after the run is enqueued. Long-running scenarios may hit the 30-minute polling timeout — the action will exit successfully with run_id and run_url set but verdict empty in that case.'
+    description: 'If true (default), wait until the run finishes and fail the job unless the verdict is pass: a fail, not sure (ambiguous), mixed, a withheld verdict, a failed or cancelled run, and a timeout all fail it. If false, return immediately after the run is enqueued.'
     required: false
     default: 'true'
+  timeout_minutes:
+    description: 'How long to wait for the verdict, in whole minutes, from 1 to 120. Default 30. The run keeps going after a timeout, but the job fails.'
+    required: false
+    default: '30'
   okship_api_base:
     description: 'OKShip API base URL. Defaults to https://okship.dev. Set it only to point the action at a different OKShip deployment.'
     required: false
@@ -31,7 +35,7 @@ outputs:
   run_url:
     description: 'Direct link to the run in the OKShip dashboard. Always set after a successful trigger.'
   verdict:
-    description: 'Run outcome: pass | fail | mixed | ambiguous. Only set when wait_for_completion=true AND the run reached a terminal state with overall_result computed.'
+    description: 'Run outcome: pass | fail | mixed | ambiguous. Only set when wait_for_completion=true AND the run finished with a verdict OKShip returned.'
 
 runs:
   using: 'node24'
