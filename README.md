@@ -23,7 +23,7 @@ jobs:
 
 ## What it does
 
-The action posts to OKShip's `/api/runs` endpoint with the supplied app and (optional) scenarios, then reads the run through OKShip MCP (`get_run` on `/api/mcp`, with the same API key) until it reaches a terminal state (`complete`, `failed`, or `cancelled`). The verdict (`pass | fail | mixed | ambiguous`) is emitted as a workflow output, and **the step fails unless the verdict is `pass`**.
+The action posts to OKShip's `/api/runs` endpoint with the supplied app and (optional) scenarios or scenario group, then reads the run through OKShip MCP (`get_run` on `/api/mcp`, with the same API key) until it reaches a terminal state (`complete`, `failed`, or `cancelled`). The verdict (`pass | fail | mixed | ambiguous`) is emitted as a workflow output, and **the step fails unless the verdict is `pass`**.
 
 ## Inputs
 
@@ -32,6 +32,7 @@ The action posts to OKShip's `/api/runs` endpoint with the supplied app and (opt
 | `api_key` | yes | — | OKShip API key. An organisation owner generates one in the OKShip dashboard under Settings → API keys. Store it in repo secrets. It needs the **Start runs** scope, and the **Read** scope too when `wait_for_completion` is `true`. |
 | `app_id` | yes | — | OKShip app UUID to run scenarios against. |
 | `scenarios` | no | (all) | Comma-separated scenario UUIDs. Defaults to all scenarios on the app. |
+| `group` | no | — | The name of one of the app's scenario groups, exactly as it appears on the app's page under By group (capital letters count). OKShip runs the group's scenarios as they are when the run starts, so adding a scenario to the group adds it to the next run. Do not set it together with `scenarios`. |
 | `wait_for_completion` | no | `true` | If `true`, wait until the run finishes, emit `verdict`, and fail the step unless it is `pass`. If `false`, return immediately after the run is enqueued. |
 | `timeout_minutes` | no | `30` | How long to wait for the verdict, in whole minutes, from 1 to 120. Any other value fails the step before a run is started. |
 | `okship_api_base` | no | `https://okship.dev` | OKShip API base URL. Set it only to point the action at a different OKShip deployment. |
@@ -78,6 +79,10 @@ These are the errors `POST /api/runs` can return to this action. The error code 
 | `invalid_scenario_ids` | 400 | One of the `scenarios` values isn't a well-formed UUID. One bad ID refuses the whole request. | Check the `scenarios` input. |
 | `app_not_found` | 404 | `app_id` doesn't exist or doesn't belong to your organisation. | Verify the UUID via your OKShip dashboard. |
 | `scenario_not_in_app` | 400 | One or more of the `scenarios` you supplied aren't on this app. | Check the `scenarios` input against the app's scenarios. |
+| `scenarios_conflict` | 400 | Both `scenarios` and `group` are set. | Set one of them. |
+| `invalid_group` | 400 | `group` isn't a usable group name. | Set `group` to the name of one of the app's scenario groups. |
+| `unknown_group` | 400 | The app has no scenario group with that name. The match is exact, capital letters included. A group that was renamed or deleted after the workflow was written is the usual cause. | Check the name on the app's page, under By group. |
+| `group_empty` | 400 | The group has no scenarios in it. | Add scenarios to the group, or use the `scenarios` input. |
 | `no_scenarios` | 422 | The app has no scenarios. | Add scenarios to the app. |
 | `target_auth_host_mismatch` | 409 | A connection attached to the app or a scenario is for a different host than the app's URL. | Correct the app's URL or the connection. |
 | `password_connections_manual_only` | 409 | The app or a scenario uses a password connection, and those runs can only be started from the dashboard. | Start this run from the dashboard, or detach the connection. |

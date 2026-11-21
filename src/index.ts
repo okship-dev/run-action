@@ -328,6 +328,7 @@ async function run(): Promise<void> {
   addSecret(apiKey);
   const appId = core.getInput("app_id", { required: true });
   const scenariosRaw = core.getInput("scenarios");
+  const group = core.getInput("group");
   const waitForCompletion = core.getInput("wait_for_completion") !== "false";
   const apiBaseRaw = core.getInput("okship_api_base") || DEFAULT_API_BASE;
   const apiBase = apiBaseRaw.replace(/\/+$/, "");
@@ -348,6 +349,12 @@ async function run(): Promise<void> {
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean);
+  }
+  // Passed through as the group's NAME. OKShip resolves it to the group's current
+  // scenarios when the run starts, and refuses a request that also names scenarios
+  // (400 scenarios_conflict), so the action does not second-guess either rule.
+  if (group) {
+    triggerBody.group = group;
   }
 
   // Any refusal (non-2xx) fails the step, as `curl --fail` does; the server's

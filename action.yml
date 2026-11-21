@@ -16,6 +16,9 @@ inputs:
   scenarios:
     description: 'Optional comma-separated scenario UUIDs. Defaults to all scenarios on the app.'
     required: false
+  group:
+    description: 'Optional name of one of the app''s scenario groups. OKShip runs the group''s scenarios as they are when the run starts. Do not set it together with scenarios.'
+    required: false
   wait_for_completion:
     description: 'If true (default), wait until the run finishes and fail the job unless the verdict is pass: a fail, not sure (ambiguous), mixed, a withheld verdict, a failed or cancelled run, and a timeout all fail it. If false, return immediately after the run is enqueued.'
     required: false

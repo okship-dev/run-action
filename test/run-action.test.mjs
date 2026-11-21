@@ -197,6 +197,53 @@ describe("okship run-action", { concurrency: true }, () => {
     });
   }
 
+  // The group input (OKShip owner ruling 152): passed through by NAME, and the
+  // wait-for-verdict behaviour that follows is unchanged.
+  check("group: the POST carries the group name and no scenario_ids, then waits for the verdict", async () => {
+    const ok = await mockOkship({ post: [{ status: 202, body: accepted }], poll: [inFlightRun("pass1_running"), terminal("pass", ["pass", "pass"])] });
+    try {
+      const r = await runAction({ base: ok.base, extraEnv: { INPUT_GROUP: "Release checks" } });
+      assert.equal(r.code, 0, r.stdout);
+      assert.equal(ok.posted().length, 1);
+      assert.deepEqual(JSON.parse(ok.posted()[0].body), { app_id: APP_ID, group: "Release checks" });
+      assert.equal(ok.polled().length, 2);
+      assert.equal(r.outputs.verdict, "pass");
+      assertNoKey(r);
+    } finally {
+      await ok.close();
+    }
+  });
+
+  check("no group input: the POST carries no group key", async () => {
+    const ok = await mockOkship({ post: [{ status: 202, body: accepted }], poll: [terminal("pass", ["pass"])] });
+    try {
+      const r = await runAction({ base: ok.base, extraEnv: { INPUT_GROUP: "" } });
+      assert.equal(r.code, 0, r.stdout);
+      assert.deepEqual(JSON.parse(ok.posted()[0].body), { app_id: APP_ID });
+    } finally {
+      await ok.close();
+    }
+  });
+
+  check("group: a 400 unknown_group fails the step, quotes OKShip's message, and never polls", async () => {
+    const message = 'This app has no scenario group named "Nope". Check the name on the app\'s page, under By group.';
+    const ok = await mockOkship({
+      post: [{ status: 400, body: { error: "unknown_group", group: "Nope", message } }],
+      poll: [terminal("pass")],
+    });
+    try {
+      const r = await runAction({ base: ok.base, extraEnv: { INPUT_GROUP: "Nope" } });
+      assert.equal(r.code, 1, r.stdout);
+      assert.ok(r.stdout.includes(message), r.stdout);
+      assert.equal(ok.posted().length, 1, "a refusal is not retried");
+      assert.equal(ok.polled().length, 0);
+      assert.equal(r.outputs.run_id, undefined);
+      assertNoKey(r);
+    } finally {
+      await ok.close();
+    }
+  });
+
   check("withheld run: polls through in-flight, stops on complete with no verdict, fails, sets no verdict", async () => {
     const ok = await mockOkship({
       post: [{ status: 202, body: accepted }],
